@@ -13,7 +13,7 @@ ALVÉRA Luma AI, ALVÉRA cilt bakım markası için geliştirilen Flask tabanlı
 
 ## Proje Yapısı
 
-```text```
+```text
 alvera_luma_ai/
 ├── app/
 │   ├── services/
