@@ -1,102 +1,168 @@
 
 import os
+import sqlite3
 
-from sqlalchemy import (
-    create_engine,
-    Column,
-    Integer,
-    String,
-    Text,
-    DateTime,
-    func,
-)
-from sqlalchemy.orm import (
-    declarative_base,
-    sessionmaker,
-)
+from pathlib import Path
 from datetime import datetime, timezone
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+# Render'da kalıcı disk varsa:
+# SQLITE_DIR=/var/data
+#
+# Yoksa proje içinde storage klasörü kullanılır.
 
-# Render bağlantı adresi eski postgres:// formatında olabilir.
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "postgres://",
-        "postgresql://",
-        1
-    )
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "postgresql://",
-        "postgresql+psycopg://",
-        1
-    )
-
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True
+DB_DIR = Path(
+    os.getenv("SQLITE_DIR", str(BASE_DIR / "storage"))
 )
 
-SessionLocal = sessionmaker(
-    bind=engine,
-    autoflush=False,
-    expire_on_commit=False
-)
+DB_DIR.mkdir(parents=True, exist_ok=True)
 
-Base = declarative_base()
+DB_PATH = DB_DIR / "alvera.db"
 
 
-class Contact(Base):
-    __tablename__ = "contacts"
-
-    id = Column(Integer, primary_key=True)
-    adSoyad = Column(String(200), nullable=False)
-    telefon = Column(String(40), nullable=True)
-    eMail = Column(String(254), nullable=True)
-    mesaj = Column(Text, nullable=False)
-    tarih = Column(
-        DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc)
+def get_db():
+    conn = sqlite3.connect(
+        str(DB_PATH),
+        timeout=30
     )
+
+    conn.row_factory = sqlite3.Row
+
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA foreign_keys = ON")
+
+    return conn
 
 
 def init_db():
-    Base.metadata.create_all(bind=engine)
+    conn = get_db()
 
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                adSoyad TEXT NOT NULL,
+                telefon TEXT,
+                eMail TEXT,
+                mesaj TEXT NOT NULL,
+                tarih TEXT NOT NULL
+            )
+        """)
 
-def serialize_contact(kayit):
-    return {
-        "id": kayit.id,
-        "adSoyad": kayit.adSoyad,
-        "telefon": kayit.telefon,
-        "eMail": kayit.eMail,
-        "mesaj": kayit.mesaj,
-        "tarih": (
-            kayit.tarih.isoformat()
-            if kayit.tarih else None
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_contacts_tarih
+            ON contacts(tarih DESC)
+        """)
+
+        conn.commit()
+
+        print(
+            "[ALVERA SQLITE] Veritabanı hazır:",
+            DB_PATH
         )
-    }
+
+    finally:
+        conn.close()
 
 
-def count_customers(session):
-    kayitlar = session.query(
-        Contact.eMail,
-        Contact.telefon,
-        Contact.adSoyad
-    ).all()
+def add_contact(adSoyad, telefon, eMail, mesaj):
+    conn = get_db()
 
-    musteriler = set()
+    try:
+        tarih = datetime.now(
+            timezone.utc
+        ).isoformat()
 
-    for email, telefon, ad in kayitlar:
-        email = (email or "").strip().lower()
-        telefon = (telefon or "").strip()
-        ad = (ad or "").strip().lower()
+        cursor = conn.execute("""
+            INSERT INTO contacts (
+                adSoyad,
+                telefon,
+                eMail,
+                mesaj,
+                tarih
+            )
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            adSoyad,
+            telefon,
+            eMail,
+            mesaj,
+            tarih
+        ))
 
-        anahtar = email or telefon or ad
+        conn.commit()
 
-        if anahtar:
-            musteriler.add(anahtar)
+        return cursor.lastrowid
 
-    return len(musteriler)
+    finally:
+        conn.close()
+
+
+def list_contacts(limit=100):
+    conn = get_db()
+
+    try:
+        rows = conn.execute("""
+            SELECT
+                id,
+                adSoyad,
+                telefon,
+                eMail,
+                mesaj,
+                tarih
+            FROM contacts
+            ORDER BY tarih DESC, id DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+        return [
+            dict(row)
+            for row in rows
+        ]
+
+    finally:
+        conn.close()
+
+
+def contact_statistics():
+    conn = get_db()
+
+    try:
+        total = conn.execute("""
+            SELECT COUNT(*) FROM contacts
+        """).fetchone()[0]
+
+        rows = conn.execute("""
+            SELECT adSoyad, telefon, eMail
+            FROM contacts
+        """).fetchall()
+
+        customers = set()
+
+        for row in rows:
+            email = (
+                row["eMail"] or ""
+            ).strip().lower()
+
+            telefon = (
+                row["telefon"] or ""
+            ).strip()
+
+            ad = (
+                row["adSoyad"] or ""
+            ).strip().lower()
+
+            key = email or telefon or ad
+
+            if key:
+                customers.add(key)
+
+        return {
+            "totalCount": total,
+            "uniqueCustomers": len(customers)
+        }
+
+    finally:
+        conn.close()
