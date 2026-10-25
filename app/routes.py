@@ -1,10 +1,10 @@
 
-import logging
-import time
-import uuid
 import os
 import re
 import hmac
+import uuid
+import time
+import logging
 
 from flask import (
     Blueprint,
@@ -13,15 +13,12 @@ from flask import (
     jsonify
 )
 
-from sqlalchemy import func
-
 from app.services.ai_service import get_ai_response
 
 from app.database import (
-    SessionLocal,
-    Contact,
-    serialize_contact,
-    count_customers
+    add_contact,
+    list_contacts,
+    contact_statistics
 )
 
 
@@ -29,9 +26,9 @@ main = Blueprint("main", __name__)
 logger = logging.getLogger(__name__)
 
 
-# ==========================================
+# =====================================
 # ANA SAYFALAR
-# ==========================================
+# =====================================
 
 @main.route("/")
 def home():
@@ -43,9 +40,23 @@ def dashboard():
     return render_template("dashboard.html")
 
 
-# ==========================================
+# =====================================
+# API ANAHTARI KONTROLÜ
+# =====================================
+
+def api_yetkili_mi():
+    beklenen = os.getenv("ALVERA_API_KEY", "")
+    gelen = request.headers.get("X-API-Key", "")
+
+    return bool(beklenen) and hmac.compare_digest(
+        gelen,
+        beklenen
+    )
+
+
+# =====================================
 # LUMA AI SOHBET
-# ==========================================
+# =====================================
 
 @main.route("/api/chat", methods=["POST"])
 def chat():
@@ -58,38 +69,44 @@ def chat():
 
         if not isinstance(data, dict):
             return jsonify({
-                "error": "Geçerli bir JSON nesnesi gönderilmelidir.",
+                "error": "Geçerli JSON gönderilmelidir.",
                 "request_id": request_id
             }), 400
 
         message = data.get("message", "")
 
-        if not isinstance(message, str) or not message.strip():
+        if not isinstance(message, str):
             return jsonify({
-                "error": "Lütfen bir mesaj yazın.",
+                "error": "Mesaj metin olmalıdır.",
                 "request_id": request_id
             }), 400
 
         message = message.strip()
 
+        if not message:
+            return jsonify({
+                "error": "Lütfen bir mesaj yazın.",
+                "request_id": request_id
+            }), 400
+
         if len(message) > 2000:
             return jsonify({
-                "error": "Mesaj 2000 karakteri aşamaz.",
+                "error": "Mesaj çok uzun.",
                 "request_id": request_id
             }), 400
 
         logger.info(
-            "Luma isteği başladı | id=%s | karakter=%s",
-            request_id,
-            len(message)
+            "Luma isteği başladı | id=%s",
+            request_id
         )
 
         response = get_ai_response(message)
 
-        if not isinstance(response, str) or not response.strip():
-            raise ValueError(
-                "AI servisi boş veya geçersiz yanıt döndürdü."
-            )
+        if (
+            not isinstance(response, str)
+            or not response.strip()
+        ):
+            raise ValueError("AI boş yanıt döndürdü.")
 
         elapsed = round(
             time.monotonic() - start_time,
@@ -97,7 +114,7 @@ def chat():
         )
 
         logger.info(
-            "Luma isteği başarılı | id=%s | süre=%ss",
+            "Luma yanıtı başarılı | id=%s | süre=%s",
             request_id,
             elapsed
         )
@@ -108,9 +125,8 @@ def chat():
         }), 200
 
     except Exception:
-
         logger.exception(
-            "Luma backend hatası | id=%s",
+            "Luma AI hatası | id=%s",
             request_id
         )
 
@@ -120,48 +136,23 @@ def chat():
         }), 502
 
 
-# ==========================================
-# API YETKİ KONTROLÜ
-# ==========================================
-
-def api_yetkili_mi():
-
-    beklenen = os.environ.get(
-        "ALVERA_API_KEY",
-        ""
-    )
-
-    gelen = request.headers.get(
-        "X-API-Key",
-        ""
-    )
-
-    return bool(beklenen) and hmac.compare_digest(
-        gelen,
-        beklenen
-    )
-
-
-# ==========================================
-# İLETİŞİM FORMU - KAYIT OLUŞTUR
-# ==========================================
+# =====================================
+# İLETİŞİM FORMU - KAYIT EKLE
+# POST /api/contacts
+# =====================================
 
 @main.route("/api/contacts", methods=["POST"])
-def contact_create():
-
-    if not api_yetkili_mi():
-        return jsonify({
-            "error": "Yetkisiz API isteği."
-        }), 401
+def create_contact():
 
     data = request.get_json(silent=True)
 
     if not isinstance(data, dict):
         return jsonify({
+            "success": False,
             "error": "Geçerli JSON gönderilmelidir."
         }), 400
 
-    ad = str(
+    adSoyad = str(
         data.get("adSoyad") or ""
     ).strip()
 
@@ -169,7 +160,7 @@ def contact_create():
         data.get("telefon") or ""
     ).strip()
 
-    email = str(
+    eMail = str(
         data.get("eMail") or ""
     ).strip().lower()
 
@@ -177,166 +168,126 @@ def contact_create():
         data.get("mesaj") or ""
     ).strip()
 
-    # Zorunlu alan kontrolü
-    if not ad or not mesaj or not (telefon or email):
+    if not adSoyad or not mesaj or not (telefon or eMail):
         return jsonify({
-            "error": "Lütfen zorunlu alanları doldurun."
+            "success": False,
+            "error": "Zorunlu alanlar eksik."
         }), 400
 
-    # Karakter sınırları
     if (
-        len(ad) > 200 or
+        len(adSoyad) > 200 or
         len(telefon) > 40 or
-        len(email) > 254 or
+        len(eMail) > 254 or
         len(mesaj) > 5000
     ):
         return jsonify({
+            "success": False,
             "error": "Alan uzunlukları geçersiz."
         }), 400
 
-    # E-posta doğrulama
-    if email and not re.fullmatch(
+    if eMail and not re.fullmatch(
         r"[^@\s]+@[^@\s]+\.[^@\s]+",
-        email
+        eMail
     ):
         return jsonify({
-            "error": "Geçersiz e-posta adresi."
+            "success": False,
+            "error": "E-posta adresi geçersiz."
         }), 400
 
-    session = SessionLocal()
-
     try:
-
-        kayit = Contact(
-            adSoyad=ad,
-            telefon=telefon,
-            eMail=email,
-            mesaj=mesaj
+        kayit_id = add_contact(
+            adSoyad,
+            telefon,
+            eMail,
+            mesaj
         )
 
-        session.add(kayit)
-        session.commit()
-
         logger.info(
-            "ALVERA iletişim kaydı oluşturuldu | id=%s",
-            kayit.id
+            "İletişim kaydı oluşturuldu | id=%s",
+            kayit_id
         )
 
         return jsonify({
             "success": True,
-            "id": kayit.id,
-            "message": "Mesajınız başarıyla kaydedildi."
+            "id": kayit_id,
+            "message": "Mesaj başarıyla kaydedildi."
         }), 201
 
     except Exception:
-
-        session.rollback()
-
-        logger.exception(
-            "[ALVERA İLETİŞİM KAYIT HATASI]"
-        )
+        logger.exception("SQLite kayıt hatası")
 
         return jsonify({
             "success": False,
-            "error": "İletişim kaydı oluşturulamadı."
+            "error": "Mesaj kaydedilemedi."
         }), 500
 
-    finally:
-        session.close()
 
-
-# ==========================================
-# YÖNETİM PANELİ - KAYITLARI GETİR
-# ==========================================
+# =====================================
+# YÖNETİM PANELİ - KAYITLAR
+# GET /api/contacts
+# =====================================
 
 @main.route("/api/contacts", methods=["GET"])
-def contacts_list():
+def get_contacts():
 
     if not api_yetkili_mi():
         return jsonify({
-            "error": "Yetkisiz API isteği."
+            "error": "Yetkisiz erişim."
         }), 401
 
-    session = SessionLocal()
-
     try:
-
-        toplam = session.query(
-            func.count(Contact.id)
-        ).scalar() or 0
-
-        kayitlar = (
-            session.query(Contact)
-            .order_by(
-                Contact.tarih.desc(),
-                Contact.id.desc()
-            )
-            .limit(100)
-            .all()
-        )
+        items = list_contacts(limit=100)
 
         return jsonify({
             "success": True,
-            "totalCount": toplam,
-            "items": [
-                serialize_contact(k)
-                for k in kayitlar
+            "items": items,
+            "totalCount": contact_statistics()[
+                "totalCount"
             ]
         }), 200
 
     except Exception:
-
         logger.exception(
-            "[ALVERA KAYIT LİSTELEME HATASI]"
+            "SQLite kayıt listeleme hatası"
         )
 
         return jsonify({
             "success": False,
-            "error": "Kayıtlar alınamadı."
+            "error": "Kayıtlar getirilemedi."
         }), 500
 
-    finally:
-        session.close()
 
-
-# ==========================================
+# =====================================
 # YÖNETİM PANELİ - İSTATİSTİKLER
-# ==========================================
+# GET /api/contacts/stats
+# =====================================
 
-@main.route("/api/contacts/stats", methods=["GET"])
-def contact_stats():
+@main.route(
+    "/api/contacts/stats",
+    methods=["GET"]
+)
+def get_stats():
 
     if not api_yetkili_mi():
         return jsonify({
-            "error": "Yetkisiz API isteği."
+            "error": "Yetkisiz erişim."
         }), 401
 
-    session = SessionLocal()
-
     try:
-
-        toplam = session.query(
-            func.count(Contact.id)
-        ).scalar() or 0
-
-        musteri = count_customers(session)
+        stats = contact_statistics()
 
         return jsonify({
             "success": True,
-            "totalCount": toplam,
-            "uniqueCustomers": musteri
+            "totalCount": stats["totalCount"],
+            "uniqueCustomers": stats["uniqueCustomers"]
         }), 200
 
     except Exception:
-
         logger.exception(
-            "[ALVERA İSTATİSTİK HATASI]"
+            "SQLite istatistik hatası"
         )
 
         return jsonify({
             "success": False,
             "error": "İstatistikler alınamadı."
         }), 500
-
-    finally:
-        session.close()
